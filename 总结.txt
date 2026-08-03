@@ -1,0 +1,212 @@
+MyCocosAdventure 逆向分析与开发记录
+2026-01-14 协议分析记录
+1. ActivityProxy(18) 协议族 analysis
+知识点记录：
+1. 协议逆向基础：游戏采用 Mod/Cmd 架构，Mod 7 (Mail), 16 (Shop), 17 (Task), 18 (Activity), 30 (ClimbTower)。
+2. 漏洞分析：
+- TaskProxy(17).TaskInfoUpdate(27): 疑似客户端上报进度，存在 SSNV 风险，可伪造任务完成。
+- ShopProxy(16).BuyGoods(3): 响应包包含 clientCost，暗示客户端可能参与价格计算，存在“0元购”风险。
+- ClimbTowerProxy(30).GetRoundReward(10): 领奖逻辑仅传 RoundID，若服务端未校验通关记录，可越级领奖。
+- MailProxy(7): 附件采用序列化字符串存储 `attachs: "[[type,id,num]]"`，需关注 AddPersonalMail(12) 是否可由客户端触发。
+3. 数据格式：部分协议字段（如 ActivityInfo, MailAttach）采用双重序列化（JSON String 嵌套在 Proto 字段中），拦截修改时需注意转义。
+4. 资源持久化：所有通过 EntityDataParser.handleClientRewardAndCost 处理的响应，只要服务端 DB 接受了请求，修改即为持久化，重登不回滚。
+3. 资源管理 with 精准劫持 (Resource Management)
+- 劫持入口: `cc.assetManager.loadAny` (位于 `coco:9349`)。
+- UI 报错原因: 之前的劫持脚本未区分资源类型。如果修改了 `cc.Prefab` 或 `cc.Texture2D` 等非 JSON 资源，会导致 UI 渲染链断裂。
+- 精准劫持策略:
+- 检查 `data instanceof cc.JsonAsset`。
+- 检查 `data.json` 是否存在。
+- 使用 `try-catch` 保护回调，确保 `originalComplete`始终执行。
+- 逻辑绕过点:
+- 成本校验: `EntityDataLoader.Ins.checkEnough` (位于 `index.ddc7d.js:L210437`)。强制返回 `true` 可绕过所有本地资源不足检查。
+- 奖励处理: `EntityDataParser.Ins.handleClientRewardAndCost` (位于 `index.ddc7d.js:L210545`)。此处可注入倍增逻辑 or 屏蔽消耗逻辑。
+- 知识点:
+- 游戏中的 `ItemLO` 等配置虽然定义 in JS 中，但其数据加载通常是通过 `BinaryReader` 解析二进制文件，而非直接加载 JSON。真正的 JSON 配置通常是动态下发的活动或 UI 布局。
+2026-01-15 奖励与错误码拦截优化
+- 目标物品劫持 (30000036):
+- 逻辑层: 劫持 `BagModule.prototype.getItemNumByID`，强制返回 `9999`，绕过本地 UI 消耗检查 and 显示限制。
+- 协议层: 劫持 `BufferUtils.decode`，针对 `SClientReward_GameDef_S2C` 类型回包，自动识别 `items` 列表。
+- 倍增逻辑: 当识别到 `code: 30000036` (Type: 3) 时，将 `num` 修改为 `1000`。
+- 全域错误码伪造 (1000系列):
+- 策略: 在 `BufferUtils.decode` 处全局拦截所有以 `1000` 开头的错误码（如 `10000004` 余额不足）。
+- 效果: 将错误码强制改为 `0` (Success)@，使客户端跳过错误弹窗逻辑，允许进入后续的 UI 交互或领取流程。
+- 持久化入口劫持:
+- 位置: `EntityDataParser.prototype.handleClientRewardAndCost`。
+- 作用: 这是 S2C 奖励分发到各个 Module（如 BagModule, WalletModule）的“总闸”。在此处修改 `reward` 对象可确保篡改后的数据被正确持久化到本地内存。
+2026-01-15 劫持脚本兼容性与执行环境规范
+- 执行环境要求:
+- 脚本必须在 `SocketMgr.prototype.onMessageHandler` 派发数据包前挂载。
+- 必须手动挂载全局引用以确保兼容性：`window.QuickLZ = y.QuickLZ || y; window.BufferUtils = f.BufferUtils; window.SocketMgrInstance = this;`。
+- 劫持策略 (V4):
+- 优先使用 `window.SocketMgrInstance` 获取底层实例。
+- 劫持 `decode` 方法是修改 S2C 数据包的最早且最稳健切入点，可确保数据在进入 `Module` 层（如 `ActivityProxy`）前已被污染。
+- 配置伪造逻辑:
+- 针对 `1100035` 等多级嵌套 JSON 的 `content` 字段，需采用双层解析策略（`JSON.parse` 内部再 `JSON.parse`）。
+- 篡改目标：`costs` 归零，`rewards` 注入高价值 ID（如 `30000036`）及数量（`9999`）。
+2026-01-15 房间皮肤 (BuildSkin) SSNV 漏洞分析
+- 核心发现: 针对 `traerules` 26-46段主角板块房间皮肤功能，确认其成功实现免费激活的根本原因是 服务端未校验 (SSNV)。
+- 对比分析:
+- BuildSkin (Mod 91): 响应处理函数 `SkinUpRResponse` 调用 `handleClientRewardAndCost(void 0, e.clientCost, !1)`。虽然客户端屏蔽了资源扣除，但服务端并未在数据库层面验证玩家是否有足够资源，直接标记为“已解锁”。
+- Derma (Mod 52): 尽管客户端代码逻辑一致，但服务端会返回 `10000015` (权限不足) 或 `10000004` (资源不足) 错误码，证明服务端存在强制校验。
+- 系统性风险点:
+- Mod 91 Cmd 7 (SkinUp): 房间皮肤永久解锁。
+- Mod 13 Cmd 5 (ChangeName): 改名成本可能存在 SSNV 风险。
+- 操作建议: 配合 `getItemNumByID` 始终返回 `9999` 的劫持，可无视 UI 限制触发上述协议，实现真实数据持久化修改。
+2026-01-16 并发利用与时序控制 (Race Condition & Timing)
+- 多路径加载器 (Loader Probing):
+- 问题: 在混淆环境中直接访问类名（如 `BagProxy`）常导致 `undefined` 或未初始化错误。
+- 对策: 使用 `window.__require` -> `window.require` -> `cc.__require` 链式探测。获取类定义后通过 `.Ins` 访问单例。
+- 公式: `const BagProxy = require("BagProxy").BagProxy.Ins;`。
+- 三位一体并发攻击 (Triple-Strike Attack):
+- 核心逻辑: 在服务端处理“邮件领取”事务的毫秒级原子性空隙内，连续发送三个数据包：
+1. `MailProxy.getMailAttachRequest(uuid)`: 触发邮件附件转背包。
+2. `BagProxy.UsePropRequest(req1)`: 使用第一张（实际存在的）券购买限购礼包。
+3. `BagProxy.UsePropRequest(req2)`: 尝试使用第二张（尚未扣除或状态未更新的）券购买其他礼包。
+- 关键字段:
+- `num`: 针对 30040005 代金券，`num`必须设为 `1` (因为背包中该 ID 堆叠数为 1)。
+- `ext`: 必须包含合法的 JSON 序列化字符串，且 `activityType` 和 `id` (如 602) 必须与目标商品对应。
+- 利用点 (Exploit Point):
+- 原子性失效: 如果服务端先处理 `MailAttach` 逻辑，在更新 `MailStatus` 和 `BagItems` 之间存在锁竞争或延迟，两个并发的 `UseProp` 可能会同时读到“代金券存在”的中间状态，从而实现“一张代金券花两次”的效果。
+- 状态记录: 2026-01-16 实现了 `concurrent_purchase_pro.js`，通过 `MailModule.getMailList()` 自动检索 30040005 附件，解决了 `BagProxy` 未初始化的问题，实现了自动化的三位一体抢购逻辑。
+2026-01-17 协议头结构与并发叠加分析
+- 协议头结构 (Binary Protocol Header):
+- C2S (客户端发送): `[2字节 长度] [1字节 模块ID] [2字节 命令ID] [1字节 SSID] [N字节 Payload]`
+- 注意: 长度字段通常为 `Payload长度 + 4`。
+- S2C (服务端返回): `[2字节 长度] [1字节 SSID] [1字节 分包ID] [1字节 总包数] [1字节 模块ID] [2字节 命令ID] [1字节 压缩标志] [N字节 Payload]`
+- SSID 机制:
+- `SSID` 是 1 字节 (1-255) 的递增计数器，用于匹配请求与响应。
+- 服务端会校验 `SSID` 的合法性。直接重放 (Replay) 历史包通常会被服务端拦截或忽略。
+2026-01-25 战斗系统层级与结算逻辑分析
+- 核心战斗链路 (Battle Chain):
+- 入口: `BattleModule.Ins` (通过 `cc.js.getClassByName("BattleModule")` 或 `cc.RF.data` 探测获取)。
+- 存储: `runtimes` (Dictionary) 维护不同类型的战斗实例。
+- 层级: `BattleRuntimeData` -> `BattleFrame` -> `BattleMainLoop` -> `engineDelegate` (BattleEngineClient)。
+- **数据: `_engineDelegate.battleStatistics` 存储实时伤害与统计，是生成 S2C 结算数据的原始来源。
+- 专家级结算调用逻辑:
+- 必须在 `BattleMainLoop` 环境下获取 `blackBoard` 对象。
+- `engineDelegate.getTotalStatic(blackBoard)` 是生成合法 `totalStatic` JSON 的核心。
+- `BattleProxy.Ins.QuitBattleRequest` 需要从 `cc.js._nameToClass` 动态检索以绕过混淆。
+2026-01-29 任务总结: 针对 10000361 错误码的 V6.2 全真注入升级
+1. 核心发现 (Discovery)
+- 时间比例校验: 经对比 [主线战斗](file:///d:/cocos开源游戏项目/主线战斗) 成功包，发现 `endFrame` 与 `totalTime` 的比例约为 10:1（例如 4286:428），而非 Cocos 默认的 50:1。V6.0 使用了 50:1 比例，导致被判定为“速度异常 (10000361)”。
+- 操作链校验: 服务端会回溯战斗中的关键操作。V6.0 仅注入 3 个操作（Ready + TimeScale），而成功包包含 17 个操作（包括 BuildHero, Move, LifeRatio 等）。缺少这些操作可能触发了逻辑校验。
+- 实时同步需求: 必须捕获 `StartGameP` (90-11) 的精准系统时间作为 `startTime`，确保 `totalTime` 上报值与实际现实经过时间符合倍率关系。
+2. 修改方案 (Solution)
+- 脚本升级: `telemetry_v6.js` 升级为 V6.2.1。
+- 全真模拟:
+- 注入完整的 17 组操作序列模板，自动适配当前的 `playerId` 和 `uuid`。
+- 动态计算 `totalTime = Math.floor(realElapsedSec * safeMultiplier * 10)`，`endFrame = totalTime * 10`。
+- 实时时间锚点: 劫持 `parserS2C` 自动捕获 `StartGameP` 协议中的 `uuid` 和开始时间。
+- 拦截注入逻辑:
+- 劫持 `SocketMgr.send` 拦截 `QuitRoom(82-4)` 请求。
+- 若当前状态为“开启注入”且发送的不是“Win”包（如玩家点击退出或战斗失败），则将其篡改为“Win”包，注入全真模板数据后发送。
+3. 混淆映射表 (Obfuscation Map)
+- `EBattleResult.Win` = 1
+- `Mod 82 Cmd 4` = `QuitRoom` (结算/退出)
+- `Mod 90 Cmd 11` = `StartGameP` (局内战斗开始)
+- `operationType 6` = `BuildHero` (建造英雄)
+- `operationType 10` = `SetLifeRatio` (血量比例)
+- `operationType 5` = `MoveHero` (移动英雄)
+2026-01-28 任务总结: 英雄属性内存修改重构 (V3.0)
+1. 核心发现 (Discovery):
+- 创建入口: `BattleEngineDelegate.prototype.onOperationPush` (index.ddc7d.js:127721) 是处理英雄上阵、升级、皮肤的核心入口。
+- 名称识别: `e.info.cfg.name` 包含英雄明文名称（如 "女娲", "阎罗王"）。
+- 属性映射: 引擎底层使用 `update_attr_value_table` 方法，属性名采用字符串常量：`ATTACK` (攻击), `P_DAMAGE_PROMOTION` (最终伤害增幅)。
+2. 混淆映射表 (Obfuscation Map):
+- `EOperationType_Build_Enum.Create` = 8
+- `EOperationType_Build_Enum.Upgrade` = 9
+- `EOperationType_Build_Enum.HeroSkin` = 18
+- `EAttrType_Battle_Enum.Atk` = 1
+3. 修改方案 (Solution):
+- 原型劫持: 劫持 `onOperationPush`，在 `Create/Upgrade/HeroSkin` 操作后，通过 `getAliveEntityIdByUuid` 获取实体 ID。
+- 精准注入: 仅针对目标英雄名称且阵营为 1 的单位，调用 `_battleEngine.update_attr_value_table` 注入暴力属性。
+- 低负担: 采用事件驱动劫持，移除 `setInterval` 扫描，完全消除性能负担。
+2026-01-28 任务总结: 自动化寻路、上床与英雄面板顺序控制 (V4.0)
+1. 核心发现 (Discovery):
+- 寻路核心: `BattleTDBaseDirector.prototype.setGridData` 是所有寻路动作的最终出口。
+- 自动上床: 逻辑位于 `_lookForBed` (index.ddc7d.js:139550)，核心操作为 `EClientOperationType_Build_Enum.SetRoomId`。
+- UI 暂停机制: 打开 `TDHeroDetailPanel` 会触发战斗引擎暂停，关闭后恢复。
+- 实体生成: 带皮肤英雄在寻路完成后会自动调用 `createBuild` 上场，产生唯一的 `UUID`。
+2. 混淆映射表 (Obfuscation Map):
+- `EClientOperationType_Build_Enum.SetRoomId` = 2
+- `EBuildType_Build_Enum.Hero` = 5
+- `TDPlayerEntity.prototype.createBuild` 签名: `(e, t, o, i)` (index.ddc7d.js:426758)
+3. 修改方案 (Solution):
+- 异步队列系统: 引入 `taskQueue` 机制，解决多个英雄同时打开面板导致的 UI 冲突。
+- 时序对齐: 采用 `await Promise` 实现“打开 -> 2000ms 停留 -> 关闭 -> 500ms 缓冲”的循环逻辑。
+- 底层钩子: 劫持 `TDPlayerEntity.prototype.createBuild` 实现 100% 的英雄 UUID 捕获率，兼容自动/手动所有场景。
+2026-01-28 任务总结: 智能变速 (3x) 与瞬时 AI 托管 (Payload V5.0)
+1. 核心发现 (Discovery):
+- 战斗倍速: 由 `BattleMain.prototype.setTimeScale` (L122293) 驱动，通过同步 HUD 和 EntityMgr 实现倍速。
+- AI 延迟: `autoSelect` (L423168) 默认通过 `TimeMgr.callLater` 强制 2 秒延迟，旨在模拟人类思考。
+- 视觉欺骗: `BattleTimeWidget.prototype.onGlobalDataChanged` (L143029) 依赖 `frameIndex` 计算 UI 时间。
+2. 混淆映射表 (Obfuscation Map):
+- `BattleMain` 实例通常作为 `BattleHUD` 的父级组件存在。
+- `TimeMgr` 核心方法：`callLater`, `callInterval`, `remove`。
+- `autoSelect` 绑定的 callback 名称通常包含 `bound autoSelect`。
+3. 修改方案 (Solution):
+- 智能倍速: 劫持 `setTimeScale` 强制锁定 `3.0`，兼顾收益效率与 7 分钟反作弊安全阈值。
+- 瞬时 AI: 劫持 `callLater` 识别 `autoSelect` 回调，将 `delay` 从 2s 压缩至 0.01s，实现秒选技能。
+- 视觉补丁: 劫持 `onGlobalDataChanged` 并对 `frameIndex` 进行 `/3` 处理，使 UI 时钟在 3x 逻辑速度下依然保持 1x 视觉流逝速度。
+- 外部接口: 暴露 `window.Hack` 提供运行时调速与 AI 模式切换能力。
+2026-01-29 战斗系统逆向补完 (Battle System Refinement)
+- 核心类名修正:
+- 战斗核心控制器在混淆代码中注册名为 `BattleBlackboard` (UUID: `5883bLdCENMwaSyiOKTii/B`)，而非 `BattleMain`。
+- 变速控制函数: `BattleBlackboard.prototype.setTimeScale`。
+- 时间管理器 (TimeMgr):
+- 注册名: `TimeMgr` (UUID: `f955eFvWC5DJ6R5R1ACxT9l`)。
+- 性质: 非 `cc.Component` 单例类，无法通过 `cc.js.getClassByName` 获取。
+- 获取方式: `const TimeMgr = cc.__require("TimeMgr").TimeMgr;` 或通过 UUID。
+- UI 计时器 (BattleTimeWidget):
+- 注册名: `BattleTimeWidget` (UUID: `c01f6kkzihAm4IpgB+ZX1yl`)。
+- 核心更新函数: `update` (负责刷新 `roundTxt.string`)。
+- 自动战斗延迟:
+- 逻辑点: `TimeMgr.callLater(2, callback)`，其中 `callback` 包含 `autoSelect`。
+[2026-01-29 15:30] 任务总结: 修复变速与AI劫持脚本
+1. 核心发现: 修正了战斗控制器的类名映射，确定了 TimeMgr 的非组件性质。
+2. 混淆映射表:
+- `BattleMain` -> `BattleBlackboard`
+- `TimeScale` -> `setTimeScale`
+3. 修改方案: 使用 `cc.__require` 链式探测非组件类，重构劫持逻辑。
+2026-01-29 任务总结: 清明活动 (1001384) 2200分结算协议分析
+1. 核心发现 (Discovery):
+- 活动代码: `1001384` (合成大西瓜)。
+- 加密逻辑: `ActView384.prototype.encodeScore` 将得分字符串倒序后，每个字符 ASCII 码加动态偏移 `value`。
+- 动态偏移: 当前环境下 `value = -26` (基于 600 分包 `[22, 22, 28]` 推导)。
+2. 混淆映射表 (Obfuscation Map):
+- `ActivityProxy(18).DoCommonOperation(16)` -> 结算上报协议。
+- `jsonArgs.score` -> 加密得分数组。
+- `jsonArgs.num` -> 最高合成等级 (`_maxLevel`)。
+3. 修改方案 (Solution):
+- 2200分结算包: `{"id":2, "score":[22, 22, 24, 24], "num":10}`。
+- Payload: 使用 `ActivityModule.Ins.doCommonOperation` 模拟上报。
+2026-01-29 任务总结: 原生 5 倍速升级与 AI 零延迟决策 (AceHacker V8.0)
+1. 核心发现 (Discovery):
+- 倍速配置: `BATTLE_SPEED_TIME_SCALE` 数组（.js:123382）定义了可选倍速。默认值为 `[1, 2]`。
+- UI 提示: `BattleFrame.prototype.setTimeSpeed`（.js:130370）负责切换倍速、更新 UI 提示文字及按钮图标。
+- AI 延迟: `TimeMgr.callLater` 负责处理 `autoSelect` 回调，硬编码延迟为 2 秒。
+- AI 轮询: `HostingMgr.prototype.bindDelegateServer` 决定了 AI 逻辑的轮询间隔（默认 1s 或 0.5s）。
+2. 混淆映射表 (Obfuscation Map):
+- `BattleClientDef` (UUID: `39aaab76d9IqJkRy5Gl7uDF`) -> 存储 `BATTLE_SPEED_TIME_SCALE`。
+- `BattleFrame` (UUID: `0cd055Z/h5PGbPSlPobMhtg`) -> 处理战斗 UI 与倍速逻辑。
+- `HostingMgr` (UUID: `f6d895A2VFNF76IuR67pXf`) -> AI 托管核心逻辑。
+3. 修改方案 (Solution):
+- 倍速重定向: 劫持 `BATTLE_SPEED_TIME_SCALE` 将 `[1, 2]` 修改为 `[1, 5]`。
+- 提示修正: 深度劫持 `setTimeSpeed`，直接设置 `setTimeScale` 和同步 `BattleModule` 状态，并强制修正 UI 提示为“已切换至 5 倍速”，复用 x2 图标解决资源缺失问题。
+- AI 瞬时化:
+- 拦截 `TimeMgr.callLater`，将 `autoSelect` 延迟压缩至 0.01s。
+- 劫持 `HostingMgr.bindDelegateServer`，将 `callInterval` 间隔从 0.5s/1s 强制提升至 0.1s。
+4. 代码实现: [AceHacker_V8.0_Simplified.js](file:///d:/cocos开源游戏项目/脚本集合文件夹/AceHacker_V8.0_Simplified.js)
+2026-01-30 任务总结: [Intel V7.4] 自动化胜利深度优化 (动态计算与副本适配)
+1. 核心发现 (Discovery):
+- 副本干扰: 部分副本（如世界Boss、爬塔）会通过 `BattleRoomHelper.getResultByEndReason` 覆盖 `checkBattleEnd` 的初始判定。
+- 全真参数动态化: 服务端可能校验 `endFrame` 与战斗实际时长的逻辑一致性（约 60FPS 比例），硬编码固定值存在风险。
+2. 修改方案 (Solution):
+- 脚本升级 (V7.4):
+- 动态时间计算: 引入 `battleStartTime`，根据 `StartGameP` 接收时间动态生成 `endFrame` (60fps) 和 `totalTime` (0.1s单位)，确保包体参数逻辑自洽。
+- 判定加固: 劫持 `checkBattleEnd` 的返回值，确保即便副本 Provider 返回非 1 结果，最终输出仍强制为 `Win (1)`。
+- 容错增强: `triggerAutoWin` 增加动态场景搜索逻辑，应对 `onLoad` 拦截失效的极端情况。
+3. 关键混淆表:
+- `BattleRoomHelper.getResultByEndReason` -> 副本结果修正器。
+- `totalTime` -> 战斗总耗时（单位：0.1秒，即 10 = 1秒）。
+- `endFrame` -> 战斗结束帧（单位：帧，通常 60 = 1秒）。
