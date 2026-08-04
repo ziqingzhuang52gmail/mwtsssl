@@ -1,0 +1,634 @@
+(function() {
+    'use strict';
+
+    if (window._aq_guard_v3) return;
+    window._aq_guard_v3 = true;
+
+    // ========== 配置 ==========
+    var CONFIG = {
+        DEFAULT_SPEED: 8,
+        BATTLE_TYPE: 3,
+        CHECK_SPEED_KEY: 40003,
+        TD_EVENT: {
+            TimeSpeedUpdate: 13,
+            LocalSetSpeed: 17
+        },
+        // 缓冲防检测配置
+        BUFFER: {
+            INITIAL_DELAY: 3000,       // 进入战斗后等3秒再首次应用倍速（让游戏自然跑一会）
+            RESET_DELAY_MIN: 1500,     // 速度被重置后最少等1.5秒
+            RESET_DELAY_MAX: 3000,     // 速度被重置后最多等3秒（随机区间）
+            WATCHDOG_INTERVAL: 1000,   // 看门狗1秒检查一次（从500ms降频）
+            MIN_BUFFER_SPEED: 1.0,     // 缓冲期最低速度（不让0.1这种超慢速通过，卡到1.0）
+            RAMP_SPEEDS: [2, 4, 8],    // 渐进式加速阶段：2x → 4x → 8x
+            RAMP_INTERVAL: 600         // 渐进式每阶间隔600ms
+        }
+    };
+
+    // ========== 状态 ==========
+    window._aq_guard = {
+        target: CONFIG.DEFAULT_SPEED,
+        enabled: false,
+        corrections: 0,
+        lastCorrected: 0,
+        lastResetTime: 0,            // 上次速度被重置的时间戳
+        pendingRestoreTimer: null,   // 延迟恢复计时器
+        battleStartTime: 0,          // 战斗开始时间
+        inBuffer: false,             // 是否在缓冲期（不强制目标倍速）
+        initialApplied: false,       // 是否已应用初始倍速
+        rampTimer: null,             // 渐进式加速计时器
+        currentScale: 1              // 当前实际倍速追踪
+    };
+
+    // ========== 工具函数 ==========
+    function log(msg) {
+        console.log('[SpeedGuard] ' + msg);
+    }
+
+    function showToast(msg, color) {
+        if (!color) color = '#00ff00';
+        var t = document.createElement('div');
+        t.style = 'position:fixed;top:12%;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.9);color:' + color + ';padding:14px 22px;border-radius:12px;z-index:9999999;font-size:14px;max-width:320px;pointer-events:none;font-weight:bold;';
+        t.innerText = msg;
+        document.body.appendChild(t);
+        setTimeout(function() {
+            t.style.opacity = '0';
+            t.style.transition = 'opacity 0.3s';
+            setTimeout(function() { t.remove(); }, 300);
+        }, 3000);
+    }
+
+    function getBattleFrameIns() {
+        // 方式1：通过 .Ins 静态属性（部分版本支持）
+        var names = ['BattleFrame', 'TDBattleFrame', 'TDBattleTeamFrame'];
+        for (var i = 0; i < names.length; i++) {
+            var cls = cc.js.getClassByName(names[i]);
+            if (cls && cls.Ins && cls.Ins._battleMain) return cls.Ins;
+        }
+        // 方式2：通过 Hook 捕获的实例引用（_setLoacalSpeed/_setTimeSpeed 被调用时存储）
+        if (window._aq_guard._capturedBfIns && window._aq_guard._capturedBfIns._battleMain) {
+            return window._aq_guard._capturedBfIns;
+        }
+        // 方式3：递归搜索场景树（深度30层）查找带 _battleMain 的组件
+        try {
+            var scene = cc.director.getScene();
+            if (scene) {
+                function searchNode(node, depth) {
+                    if (depth > 30) return null;
+                    var comps = node.getComponents ? node.getComponents(cc.Component) : [];
+                    for (var i = 0; i < comps.length; i++) {
+                        if (comps[i]._battleMain) return comps[i];
+                    }
+                    if (node.children) {
+                        for (var j = 0; j < node.children.length; j++) {
+                            var found = searchNode(node.children[j], depth + 1);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
+                }
+                var found = searchNode(scene, 0);
+                if (found) return found;
+            }
+        } catch(e) {}
+        // 方式4：通过 BattleMainLoop 查找（新版速度控制路径）
+        // 新版游戏不使用 BattleFrame._battleMain，而是直接用 BattleMainLoop
+        // BattleMainLoop.setTimeScale() 修改 frameSync.timeScale 和 blackBoard.timeScale
+        try {
+            var scene2 = cc.director.getScene();
+            if (scene2) {
+                function searchBML(node, depth) {
+                    if (depth > 30 || !node) return null;
+                    try {
+                        var comps = node.getComponents ? node.getComponents(cc.Component) : [];
+                        for (var i = 0; i < comps.length; i++) {
+                            if (cc.js.getClassName(comps[i]) === 'BattleMainLoop' && comps[i]._inBattle) {
+                                return comps[i];
+                            }
+                        }
+                    } catch(e) {}
+                    if (node.children) {
+                        for (var j = 0; j < node.children.length; j++) {
+                            var found = searchBML(node.children[j], depth + 1);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
+                }
+                var bml = searchBML(scene2, 0);
+                if (bml) return bml;
+            }
+        } catch(e) {}
+        return null;
+    }
+
+    // 查找 BattleEntityMgr 实例（用于同步设置所有实体的 timeScale）
+    function getBattleEntityMgr() {
+        try {
+            var scene = cc.director.getScene();
+            if (!scene) return null;
+            function searchBEM(node, depth) {
+                if (depth > 30 || !node) return null;
+                try {
+                    var comps = node.getComponents ? node.getComponents(cc.Component) : [];
+                    for (var i = 0; i < comps.length; i++) {
+                        if (cc.js.getClassName(comps[i]) === 'BattleEntityMgr') return comps[i];
+                    }
+                } catch(e) {}
+                if (node.children) {
+                    for (var j = 0; j < node.children.length; j++) {
+                        var found = searchBEM(node.children[j], depth + 1);
+                        if (found) return found;
+                    }
+                }
+                return null;
+            }
+            return searchBEM(scene, 0);
+        } catch(e) { return null; }
+    }
+
+    // ========== 倍速应用函数 ==========
+
+    // 直接应用目标倍速（无延迟、无渐进）
+    // 注意：不使用 scheduler.setTimeScale，因为它会影响 Spine 动画的时间轴
+    // 导致 FFD 变形动画的 binarySearch 返回越界索引，引发 undefined[0] 错误
+    // 只使用 _battleMain.setTimeScale 控制战斗引擎子系统速度
+    function applyTargetSpeed() {
+        try {
+            var bfIns = getBattleFrameIns();
+            if (bfIns) {
+                var applied = false;
+                // 新版路径：BattleMainLoop.setTimeScale（修改 frameSync 和 blackBoard）
+                if (bfIns.setTimeScale && bfIns._inBattle !== undefined) {
+                    bfIns.setTimeScale(window._aq_guard.target);
+                    applied = true;
+                }
+                // 旧版路径：_battleMain.setTimeScale
+                if (bfIns._battleMain && bfIns._battleMain.setTimeScale) {
+                    bfIns._battleMain.setTimeScale(window._aq_guard.target);
+                    applied = true;
+                }
+                // 同步设置 BattleEntityMgr.setTimeScale（遍历所有实体）
+                var BEM = getBattleEntityMgr();
+                if (BEM && BEM.setTimeScale) {
+                    BEM.setTimeScale(window._aq_guard.target);
+                }
+                // BM 缓存修正
+                var BM = cc.js.getClassByName('BattleModule');
+                if (BM && BM.Ins) {
+                    if (bfIns._battleType != null) {
+                        BM.Ins.setSpeedByBattleType(bfIns._battleType, window._aq_guard.target);
+                    } else {
+                        BM.Ins.setSpeedByBattleType(CONFIG.BATTLE_TYPE, window._aq_guard.target);
+                    }
+                }
+                if (applied) {
+                    window._aq_guard.currentScale = window._aq_guard.target;
+                    return true;
+                }
+            }
+            // 回退方案：通过 TDModule 事件分发触发 _setLoacalSpeed
+            var TD = cc.js.getClassByName('TDModule');
+            if (TD && TD.Ins) {
+                log('applyTargetSpeed: bfIns not found, dispatching LocalSetSpeed event');
+                TD.Ins.dispatchEvent(CONFIG.TD_EVENT.LocalSetSpeed, window._aq_guard.target);
+                window._aq_guard.currentScale = window._aq_guard.target;
+                return true;
+            }
+            return false;
+        } catch(e) {
+            log('applyTargetSpeed error: ' + e.message);
+            return false;
+        }
+    }
+
+    // 渐进式应用倍速：2x → 4x → 8x
+    function applyTargetSpeedWithRamp() {
+        if (window._aq_guard.rampTimer) {
+            clearTimeout(window._aq_guard.rampTimer);
+            window._aq_guard.rampTimer = null;
+        }
+
+        var stages = CONFIG.BUFFER.RAMP_SPEEDS;
+        var target = window._aq_guard.target;
+        var stageIndex = 0;
+
+        function applyStage() {
+            if (stageIndex >= stages.length) {
+                window._aq_guard.rampTimer = null;
+                window._aq_guard.currentScale = target;
+                log('Ramp complete: ' + target + 'x');
+                return;
+            }
+
+            var stageSpeed = stages[stageIndex];
+            if (stageSpeed > target) stageSpeed = target;
+
+            try {
+                var bfIns = getBattleFrameIns();
+                if (bfIns) {
+                    // 新版路径：BattleMainLoop.setTimeScale
+                    if (bfIns.setTimeScale && bfIns._inBattle !== undefined) {
+                        bfIns.setTimeScale(stageSpeed);
+                    }
+                    // 旧版路径：_battleMain.setTimeScale
+                    if (bfIns._battleMain && bfIns._battleMain.setTimeScale) {
+                        bfIns._battleMain.setTimeScale(stageSpeed);
+                    }
+                    // 同步 BattleEntityMgr
+                    var BEM = getBattleEntityMgr();
+                    if (BEM && BEM.setTimeScale) {
+                        BEM.setTimeScale(stageSpeed);
+                    }
+                    window._aq_guard.currentScale = stageSpeed;
+                    log('Ramp stage ' + (stageIndex + 1) + ': ' + stageSpeed + 'x');
+                }
+            } catch(e) {}
+
+            stageIndex++;
+            window._aq_guard.rampTimer = setTimeout(applyStage, CONFIG.BUFFER.RAMP_INTERVAL);
+        }
+
+        applyStage();
+    }
+
+    // 延迟恢复倍速（核心缓冲逻辑）
+    function scheduleSpeedRestore(reason) {
+        // 取消已有的恢复计时器
+        if (window._aq_guard.pendingRestoreTimer) {
+            clearTimeout(window._aq_guard.pendingRestoreTimer);
+        }
+        // 取消已有的渐进计时器
+        if (window._aq_guard.rampTimer) {
+            clearTimeout(window._aq_guard.rampTimer);
+            window._aq_guard.rampTimer = null;
+        }
+
+        // 进入缓冲期：让游戏自然速度运行
+        window._aq_guard.inBuffer = true;
+        window._aq_guard.lastResetTime = Date.now();
+
+        // 随机延迟 1.5~3秒
+        var delay = CONFIG.BUFFER.RESET_DELAY_MIN +
+                    Math.random() * (CONFIG.BUFFER.RESET_DELAY_MAX - CONFIG.BUFFER.RESET_DELAY_MIN);
+
+        log('Buffer start (' + (reason || 'unknown') + '), restore in ' + Math.round(delay) + 'ms');
+
+        window._aq_guard.pendingRestoreTimer = setTimeout(function() {
+            window._aq_guard.inBuffer = false;
+            window._aq_guard.pendingRestoreTimer = null;
+            log('Buffer end, ramping to ' + window._aq_guard.target + 'x');
+            applyTargetSpeedWithRamp();
+        }, delay);
+    }
+
+    // 初始战斗延迟（进入战斗后等几秒再开始加速）
+    function scheduleInitialSpeed() {
+        window._aq_guard.inBuffer = true;
+        log('Initial delay: ' + CONFIG.BUFFER.INITIAL_DELAY + 'ms before first speedup');
+
+        window._aq_guard.pendingRestoreTimer = setTimeout(function() {
+            window._aq_guard.inBuffer = false;
+            window._aq_guard.pendingRestoreTimer = null;
+            window._aq_guard.initialApplied = true;
+            log('Initial delay complete, ramping to ' + window._aq_guard.target + 'x');
+            applyTargetSpeedWithRamp();
+        }, CONFIG.BUFFER.INITIAL_DELAY);
+    }
+
+    // ========== 安装拦截 ==========
+    function installGuard() {
+
+        // 1. BM缓存修正（缓冲感知：缓冲期返回原始值）
+        try {
+            var BM = cc.js.getClassByName('BattleModule');
+            if (BM && BM.Ins) {
+                BM.Ins.setSpeedByBattleType(CONFIG.BATTLE_TYPE, window._aq_guard.target);
+                var origGet = BM.Ins.getSpeedByBattleType;
+                if (origGet && !BM.Ins._guardGetHooked) {
+                    BM.Ins.getSpeedByBattleType = function(bt) {
+                        var r = origGet.apply(this, arguments);
+                        // 非缓冲期：返回目标倍速
+                        if (window._aq_guard.enabled && !window._aq_guard.inBuffer && r > 0 && r < window._aq_guard.target) {
+                            log('BM.getSpeedByBattleType(' + bt + ')=' + r + ' -> ' + window._aq_guard.target);
+                            return window._aq_guard.target;
+                        }
+                        // 缓冲期：返回原始值（让游戏自然恢复1.6x）
+                        return r;
+                    };
+                    BM.Ins._guardGetHooked = true;
+                }
+                log('BattleModule cache corrected to ' + window._aq_guard.target + 'x');
+            }
+        } catch(e) { log('BM hook error: ' + e.message); }
+
+        // 2. TDModule.dispatchEvent 拦截（缓冲感知）
+        try {
+            var TD = cc.js.getClassByName('TDModule');
+            if (TD && TD.Ins && !TD.Ins._guardHooked) {
+                var origDisp = TD.Ins.dispatchEvent;
+                TD.Ins.dispatchEvent = function() {
+                    var args = Array.prototype.slice.call(arguments);
+
+                    // LocalSetSpeed: 召唤抽卡时的速度重置事件
+                    if (args[0] === CONFIG.TD_EVENT.LocalSetSpeed && window._aq_guard.enabled) {
+                        var origVal = args[1];
+                        if (Array.isArray(origVal)) origVal = origVal[0];
+
+                        if (origVal !== undefined) {
+                            // 缓冲期：将超慢速(0.1)卡到最低1.0，但不强制8x
+                            if (origVal < CONFIG.BUFFER.MIN_BUFFER_SPEED) {
+                                log('LocalSetSpeed(' + origVal + ') -> ' + CONFIG.BUFFER.MIN_BUFFER_SPEED + ' (buffer cap)');
+                                if (Array.isArray(args[1])) args[1] = [CONFIG.BUFFER.MIN_BUFFER_SPEED];
+                                else args[1] = CONFIG.BUFFER.MIN_BUFFER_SPEED;
+                            }
+
+                            // 不立即替换为目标倍速，而是调度延迟恢复
+                            if (origVal !== window._aq_guard.target) {
+                                window._aq_guard.corrections++;
+                                window._aq_guard.lastCorrected = Date.now();
+                                scheduleSpeedRestore('LocalSetSpeed=' + origVal);
+                            }
+                        }
+                    }
+
+                    // TimeSpeedUpdate: 速度更新事件
+                    if (args[0] === CONFIG.TD_EVENT.TimeSpeedUpdate && window._aq_guard.enabled) {
+                        var origSpd = args[1];
+                        if (Array.isArray(origSpd)) origSpd = origSpd[0];
+                        // 非缓冲期：替换为目标倍速
+                        if (origSpd !== undefined && origSpd !== window._aq_guard.target && !window._aq_guard.inBuffer) {
+                            log('TimeSpeedUpdate(' + origSpd + ') -> ' + window._aq_guard.target);
+                            if (Array.isArray(args[1])) args[1] = [window._aq_guard.target];
+                            else args[1] = window._aq_guard.target;
+                        }
+                        // 缓冲期：让原始值通过
+                    }
+
+                    return origDisp.apply(this, args);
+                };
+                TD.Ins._guardHooked = true;
+                log('TDModule.dispatchEvent guard installed (buffer-aware)');
+            }
+        } catch(e) { log('TD hook error: ' + e.message); }
+
+        // 3. 子类 _setLoacalSpeed 和 _setTimeSpeed 拦截
+        var frameClasses = ['TDBattleFrame', 'TDBattleTeamFrame'];
+        frameClasses.forEach(function(className) {
+            try {
+                var cls = cc.js.getClassByName(className);
+                if (!cls || !cls.prototype || cls.prototype._guardHooked) return;
+
+                // _setLoacalSpeed: 让游戏速度通过（cap最低1.0），调度延迟恢复
+                var origLocal = cls.prototype._setLoacalSpeed;
+                if (origLocal) {
+                    cls.prototype._setLoacalSpeed = function(e, t) {
+                        if (window._aq_guard.enabled) {
+                            var val = t && t[0];
+                            if (val !== undefined) {
+                                // 缓冲期最低速度1.0（不让0.1的超慢速通过）
+                                if (val < CONFIG.BUFFER.MIN_BUFFER_SPEED) {
+                                    log(className + '._setLoacalSpeed(' + val + ') -> ' + CONFIG.BUFFER.MIN_BUFFER_SPEED + ' (buffer cap)');
+                                    if (t && t.length) t[0] = CONFIG.BUFFER.MIN_BUFFER_SPEED;
+                                    else t = [CONFIG.BUFFER.MIN_BUFFER_SPEED];
+                                    val = CONFIG.BUFFER.MIN_BUFFER_SPEED;
+                                }
+                                // 调度延迟恢复（不立即替换为8x）
+                                if (val !== window._aq_guard.target) {
+                                    window._aq_guard.corrections++;
+                                    window._aq_guard.lastCorrected = Date.now();
+                                    scheduleSpeedRestore(className + '._setLoacalSpeed=' + val);
+                                }
+                            }
+                        }
+                        return origLocal.apply(this, arguments);
+                    };
+                }
+
+                // _setTimeSpeed: 阻止网络请求，调度延迟恢复
+                var origSetTime = cls.prototype._setTimeSpeed;
+                if (origSetTime) {
+                    cls.prototype._setTimeSpeed = function(e) {
+                        if (window._aq_guard.enabled) {
+                            // 阻止原方法（不发SetSpeed网络请求到服务器）
+                            // 调度延迟恢复到目标倍速
+                            scheduleSpeedRestore(className + '._setTimeSpeed=' + e);
+                            log(className + '._setTimeSpeed blocked, scheduled restore');
+                            return;
+                        }
+                        return origSetTime.apply(this, arguments);
+                    };
+                }
+
+                cls.prototype._guardHooked = true;
+                log(className + ' guards installed (buffer-aware)');
+            } catch(e) { log(className + ' hook error: ' + e.message); }
+        });
+
+        // 4. BattleFrame._onButtonSpeed: 阻止手动切换，调度延迟恢复
+        try {
+            var BF = cc.js.getClassByName('BattleFrame');
+            if (BF && BF.prototype && !BF.prototype._guardHooked) {
+                var origBtn = BF.prototype._onButtonSpeed;
+                if (origBtn) {
+                    BF.prototype._onButtonSpeed = function(e) {
+                        if (window._aq_guard.enabled) {
+                            log('BF._onButtonSpeed intercepted, scheduling restore');
+                            scheduleSpeedRestore('button_click');
+                            return;
+                        }
+                        return origBtn.apply(this, arguments);
+                    };
+                }
+                BF.prototype._guardHooked = true;
+                log('BattleFrame._onButtonSpeed guard installed');
+            }
+        } catch(e) { log('BF hook error: ' + e.message); }
+
+        // 5. Spine 动画保护（不 Hook scheduler.setTimeScale）
+        // scheduler.setTimeScale 会影响 Spine 动画时间轴，导致 FFD 变形动画
+        // 的 binarySearch 返回越界索引，引发 undefined[0] 错误卡顿
+        // 因此完全不 Hook scheduler，只通过 _battleMain.setTimeScale 控制战斗速度
+        try {
+            var scene = cc.director.getScene();
+            var spinePatched = 0;
+            function patchSpineUpdate(node, depth) {
+                if (depth > 10) return;
+                var comps = node.getComponents ? node.getComponents(cc.Component) : [];
+                for (var i = 0; i < comps.length; i++) {
+                    var c = comps[i];
+                    try {
+                        if (c.update && !c._spinePatched) {
+                            var updateStr = c.update.toString();
+                            if (updateStr.indexOf('isCustomUpdate') >= 0 || updateStr.indexOf('prototype.update') >= 0) {
+                                var origUpdate = c.update.bind(c);
+                                c.update = function(dt) {
+                                    try { origUpdate(dt); } catch(e) {}
+                                };
+                                c._spinePatched = true;
+                                spinePatched++;
+                            }
+                        }
+                    } catch(e) {}
+                }
+                if (node.children) {
+                    for (var j = 0; j < node.children.length; j++) patchSpineUpdate(node.children[j], depth+1);
+                }
+            }
+            if (scene && scene.children[0]) patchSpineUpdate(scene.children[0], 0);
+            log('Spine update protection: ' + spinePatched + ' components patched');
+        } catch(e) { log('Spine patch error: ' + e.message); }
+
+        // 6. 看门狗（缓冲感知 + 退出战斗检测 + Spine 清理）
+        var watchdog = setInterval(function() {
+            try {
+                var bfIns = getBattleFrameIns();
+                // 通过 _inBattle 属性判断是否真正在战斗中
+                var isInBattle = bfIns && (bfIns._inBattle === true || (bfIns._inBattle === undefined && bfIns._battleMain));
+                if (isInBattle) {
+                    // 首次检测到战斗
+                    if (!window._aq_guard.enabled) {
+                        window._aq_guard.enabled = true;
+                        window._aq_guard.battleStartTime = Date.now();
+                        log('Battle detected! Initial delay: ' + CONFIG.BUFFER.INITIAL_DELAY + 'ms');
+                        scheduleInitialSpeed();
+                        return;
+                    }
+
+                    // 跳过条件：缓冲中 / 有待恢复计时器 / 渐进中 / 初始延迟未完成
+                    if (window._aq_guard.inBuffer) return;
+                    if (window._aq_guard.pendingRestoreTimer) return;
+                    if (window._aq_guard.rampTimer) return;
+                    if (!window._aq_guard.initialApplied) return;
+
+                    // 检查当前速度是否低于目标
+                    var currentScale = window._aq_guard.currentScale || 1;
+                    if (currentScale > 0 && currentScale < window._aq_guard.target) {
+                        log('Watchdog: speed=' + currentScale + ' < target=' + window._aq_guard.target + ', restoring');
+                        applyTargetSpeed();
+                    }
+                } else {
+                    // 退出战斗检测：bfIns 消失或 _inBattle=false
+                    if (window._aq_guard.enabled) {
+                        log('Battle ended, cleaning up...');
+                        window._aq_guard.enabled = false;
+                        window._aq_guard.initialApplied = false;
+                        window._aq_guard.inBuffer = false;
+                        window._aq_guard.currentScale = 1;
+
+                        // 取消所有计时器
+                        if (window._aq_guard.pendingRestoreTimer) {
+                            clearTimeout(window._aq_guard.pendingRestoreTimer);
+                            window._aq_guard.pendingRestoreTimer = null;
+                        }
+                        if (window._aq_guard.rampTimer) {
+                            clearTimeout(window._aq_guard.rampTimer);
+                            window._aq_guard.rampTimer = null;
+                        }
+
+                        // 恢复 scheduler 到 1x（安全退出）
+                        var scheduler = cc.director.getScheduler();
+                        if (scheduler) scheduler.setTimeScale(1);
+
+                        // 清理 Spine 动画状态（防止退出战斗后 FFD 数据残留导致卡顿）
+                        try {
+                            var scene = cc.director.getScene();
+                            if (scene && scene.children[0]) {
+                                function clearSpineTracks(node, depth) {
+                                    if (depth > 10) return;
+                                    var comps = node.getComponents ? node.getComponents(cc.Component) : [];
+                                    for (var i = 0; i < comps.length; i++) {
+                                        var c = comps[i];
+                                        try {
+                                            if (c._state && c._state.clearTracks) {
+                                                c._state.clearTracks();
+                                            }
+                                        } catch(e) {}
+                                    }
+                                    if (node.children) {
+                                        for (var j = 0; j < node.children.length; j++) clearSpineTracks(node.children[j], depth+1);
+                                    }
+                                }
+                                clearSpineTracks(scene.children[0], 0);
+                                log('Spine tracks cleared on battle exit');
+                            }
+                        } catch(e) { log('Spine cleanup error: ' + e.message); }
+                    }
+                }
+            } catch(e) {}
+        }, CONFIG.BUFFER.WATCHDOG_INTERVAL);
+        window._aq_guard._timer = watchdog;
+
+        // 7. 关闭客户端速度检测
+        try {
+            var SDKMgr = cc.js.getClassByName('SDKMgr');
+            if (SDKMgr && SDKMgr.Ins && SDKMgr.Ins.performConfig) {
+                var checkTimer = setInterval(function() {
+                    try {
+                        if (SDKMgr.Ins.performConfig) {
+                            SDKMgr.Ins.performConfig[CONFIG.CHECK_SPEED_KEY] = false;
+                            clearInterval(checkTimer);
+                            log('Speed check disabled');
+                        }
+                    } catch(e) {}
+                }, 500);
+            }
+        } catch(e) {}
+
+        log('Speed Guard v3.2 (No-Scheduler + Spine-Safe) installed. Target: ' + window._aq_guard.target + 'x');
+    }
+
+    // ========== 全局API ==========
+    window.setGuardSpeed = function(n) {
+        if (isNaN(n) || n <= 0 || n > 50) { log('Invalid: ' + n); return; }
+        window._aq_guard.target = n;
+        var BM = cc.js.getClassByName('BattleModule');
+        if (BM && BM.Ins) BM.Ins.setSpeedByBattleType(CONFIG.BATTLE_TYPE, n);
+        // 非缓冲期立即应用
+        if (!window._aq_guard.inBuffer && window._aq_guard.initialApplied) {
+            applyTargetSpeed();
+        }
+        showToast('Guard: ' + n + 'x', '#00ff00');
+    };
+
+    window.getGuardStatus = function() {
+        var info = {
+            target: window._aq_guard.target + 'x',
+            enabled: window._aq_guard.enabled,
+            inBuffer: window._aq_guard.inBuffer,
+            initialApplied: window._aq_guard.initialApplied,
+            currentScale: window._aq_guard.currentScale,
+            corrections: window._aq_guard.corrections,
+            lastCorrected: window._aq_guard.lastCorrected ? (Date.now() - window._aq_guard.lastCorrected) + 'ms ago' : 'never',
+            battleDuration: window._aq_guard.battleStartTime ? Math.round((Date.now() - window._aq_guard.battleStartTime) / 1000) + 's' : 'not started',
+            pendingRestore: window._aq_guard.pendingRestoreTimer ? 'yes' : 'no',
+            rampActive: window._aq_guard.rampTimer ? 'yes' : 'no'
+        };
+        console.log('[SpeedGuard] Status:', JSON.stringify(info, null, 2));
+        return info;
+    };
+
+    // 手动触发缓冲
+    window.triggerBuffer = function(reason) {
+        scheduleSpeedRestore(reason || 'manual');
+        showToast('Buffer triggered: ' + reason, '#ffcc00');
+    };
+
+    // ========== 启动 ==========
+    function waitCocos(cb) {
+        var timer = setInterval(function() {
+            if (typeof cc !== 'undefined' && cc.js && cc.js.getClassByName) {
+                clearInterval(timer);
+                cb();
+            }
+        }, 500);
+    }
+
+    waitCocos(function() {
+        log('Cocos ready, installing buffer guards...');
+        installGuard();
+        setTimeout(function() {
+            showToast('Guard v3.2 ready: ' + CONFIG.DEFAULT_SPEED + 'x (Spine-Safe)', '#00ff00');
+        }, 800);
+    });
+})();

@@ -1,0 +1,559 @@
+// ==UserScript==
+// @name         MyCocos - SpeedGuard 缓冲防检测
+// @namespace    http://tampermonkey.net/
+// @version      3.2
+// @description  战斗倍速缓冲防检测，渐进式加速，Spine安全，无UI缺失 (iOS专用)
+// @author       Ace
+// @match        *://*/*
+// @grant        none
+// @run-at       document-end
+// @allFrames    true
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    if (window._aq_guard_v3) return;
+    window._aq_guard_v3 = true;
+
+    // ========== 配置 ==========
+    var CONFIG = {
+        DEFAULT_SPEED: 8,
+        BATTLE_TYPE: 3,
+        CHECK_SPEED_KEY: 40003,
+        TD_EVENT: {
+            TimeSpeedUpdate: 13,
+            LocalSetSpeed: 17
+        },
+        BUFFER: {
+            INITIAL_DELAY: 3000,
+            RESET_DELAY_MIN: 1500,
+            RESET_DELAY_MAX: 3000,
+            WATCHDOG_INTERVAL: 1000,
+            MIN_BUFFER_SPEED: 1.0,
+            RAMP_SPEEDS: [2, 4, 8],
+            RAMP_INTERVAL: 600
+        }
+    };
+
+    // ========== 状态 ==========
+    window._aq_guard = {
+        target: CONFIG.DEFAULT_SPEED,
+        enabled: false,
+        corrections: 0,
+        lastCorrected: 0,
+        lastResetTime: 0,
+        pendingRestoreTimer: null,
+        battleStartTime: 0,
+        inBuffer: false,
+        initialApplied: false,
+        rampTimer: null,
+        currentScale: 1
+    };
+
+    // ========== 工具函数 ==========
+    function log(msg) {
+        console.log('[SpeedGuard] ' + msg);
+    }
+
+    function showToast(msg, color) {
+        if (!color) color = '#00ff00';
+        var t = document.createElement('div');
+        t.style = 'position:fixed;top:12%;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.9);color:' + color + ';padding:14px 22px;border-radius:12px;z-index:9999999;font-size:14px;max-width:320px;pointer-events:none;font-weight:bold;';
+        t.innerText = msg;
+        document.body.appendChild(t);
+        setTimeout(function() {
+            t.style.opacity = '0';
+            t.style.transition = 'opacity 0.3s';
+            setTimeout(function() { t.remove(); }, 300);
+        }, 3000);
+    }
+
+    function getBattleFrameIns() {
+        var names = ['BattleFrame', 'TDBattleFrame', 'TDBattleTeamFrame'];
+        for (var i = 0; i < names.length; i++) {
+            var cls = cc.js.getClassByName(names[i]);
+            if (cls && cls.Ins && cls.Ins._battleMain) return cls.Ins;
+        }
+        if (window._aq_guard._capturedBfIns && window._aq_guard._capturedBfIns._battleMain) {
+            return window._aq_guard._capturedBfIns;
+        }
+        try {
+            var scene = cc.director.getScene();
+            if (scene) {
+                function searchNode(node, depth) {
+                    if (depth > 30) return null;
+                    var comps = node.getComponents ? node.getComponents(cc.Component) : [];
+                    for (var i = 0; i < comps.length; i++) {
+                        if (comps[i]._battleMain) return comps[i];
+                    }
+                    if (node.children) {
+                        for (var j = 0; j < node.children.length; j++) {
+                            var found = searchNode(node.children[j], depth + 1);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
+                }
+                var found = searchNode(scene, 0);
+                if (found) return found;
+            }
+        } catch(e) {}
+        try {
+            var scene2 = cc.director.getScene();
+            if (scene2) {
+                function searchBML(node, depth) {
+                    if (depth > 30 || !node) return null;
+                    try {
+                        var comps = node.getComponents ? node.getComponents(cc.Component) : [];
+                        for (var i = 0; i < comps.length; i++) {
+                            if (cc.js.getClassName(comps[i]) === 'BattleMainLoop' && comps[i]._inBattle) {
+                                return comps[i];
+                            }
+                        }
+                    } catch(e) {}
+                    if (node.children) {
+                        for (var j = 0; j < node.children.length; j++) {
+                            var found = searchBML(node.children[j], depth + 1);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
+                }
+                var bml = searchBML(scene2, 0);
+                if (bml) return bml;
+            }
+        } catch(e) {}
+        return null;
+    }
+
+    function getBattleEntityMgr() {
+        try {
+            var scene = cc.director.getScene();
+            if (!scene) return null;
+            function searchBEM(node, depth) {
+                if (depth > 30 || !node) return null;
+                try {
+                    var comps = node.getComponents ? node.getComponents(cc.Component) : [];
+                    for (var i = 0; i < comps.length; i++) {
+                        if (cc.js.getClassName(comps[i]) === 'BattleEntityMgr') return comps[i];
+                    }
+                } catch(e) {}
+                if (node.children) {
+                    for (var j = 0; j < node.children.length; j++) {
+                        var found = searchBEM(node.children[j], depth + 1);
+                        if (found) return found;
+                    }
+                }
+                return null;
+            }
+            return searchBEM(scene, 0);
+        } catch(e) { return null; }
+    }
+
+    // ========== 倍速应用函数 ==========
+    function applyTargetSpeed() {
+        try {
+            var bfIns = getBattleFrameIns();
+            if (bfIns) {
+                var applied = false;
+                if (bfIns.setTimeScale && bfIns._inBattle !== undefined) {
+                    bfIns.setTimeScale(window._aq_guard.target);
+                    applied = true;
+                }
+                if (bfIns._battleMain && bfIns._battleMain.setTimeScale) {
+                    bfIns._battleMain.setTimeScale(window._aq_guard.target);
+                    applied = true;
+                }
+                var BEM = getBattleEntityMgr();
+                if (BEM && BEM.setTimeScale) {
+                    BEM.setTimeScale(window._aq_guard.target);
+                }
+                var BM = cc.js.getClassByName('BattleModule');
+                if (BM && BM.Ins) {
+                    if (bfIns._battleType != null) {
+                        BM.Ins.setSpeedByBattleType(bfIns._battleType, window._aq_guard.target);
+                    } else {
+                        BM.Ins.setSpeedByBattleType(CONFIG.BATTLE_TYPE, window._aq_guard.target);
+                    }
+                }
+                if (applied) {
+                    window._aq_guard.currentScale = window._aq_guard.target;
+                    return true;
+                }
+            }
+            var TD = cc.js.getClassByName('TDModule');
+            if (TD && TD.Ins) {
+                log('applyTargetSpeed: bfIns not found, dispatching LocalSetSpeed event');
+                TD.Ins.dispatchEvent(CONFIG.TD_EVENT.LocalSetSpeed, window._aq_guard.target);
+                window._aq_guard.currentScale = window._aq_guard.target;
+                return true;
+            }
+            return false;
+        } catch(e) {
+            log('applyTargetSpeed error: ' + e.message);
+            return false;
+        }
+    }
+
+    function applyTargetSpeedWithRamp() {
+        if (window._aq_guard.rampTimer) {
+            clearTimeout(window._aq_guard.rampTimer);
+            window._aq_guard.rampTimer = null;
+        }
+        var stages = CONFIG.BUFFER.RAMP_SPEEDS;
+        var target = window._aq_guard.target;
+        var stageIndex = 0;
+        function applyStage() {
+            if (stageIndex >= stages.length) {
+                window._aq_guard.rampTimer = null;
+                window._aq_guard.currentScale = target;
+                log('Ramp complete: ' + target + 'x');
+                return;
+            }
+            var stageSpeed = stages[stageIndex];
+            if (stageSpeed > target) stageSpeed = target;
+            try {
+                var bfIns = getBattleFrameIns();
+                if (bfIns) {
+                    if (bfIns.setTimeScale && bfIns._inBattle !== undefined) {
+                        bfIns.setTimeScale(stageSpeed);
+                    }
+                    if (bfIns._battleMain && bfIns._battleMain.setTimeScale) {
+                        bfIns._battleMain.setTimeScale(stageSpeed);
+                    }
+                    var BEM = getBattleEntityMgr();
+                    if (BEM && BEM.setTimeScale) {
+                        BEM.setTimeScale(stageSpeed);
+                    }
+                    window._aq_guard.currentScale = stageSpeed;
+                    log('Ramp stage ' + (stageIndex + 1) + ': ' + stageSpeed + 'x');
+                }
+            } catch(e) {}
+            stageIndex++;
+            window._aq_guard.rampTimer = setTimeout(applyStage, CONFIG.BUFFER.RAMP_INTERVAL);
+        }
+        applyStage();
+    }
+
+    function scheduleSpeedRestore(reason) {
+        if (window._aq_guard.pendingRestoreTimer) {
+            clearTimeout(window._aq_guard.pendingRestoreTimer);
+        }
+        if (window._aq_guard.rampTimer) {
+            clearTimeout(window._aq_guard.rampTimer);
+            window._aq_guard.rampTimer = null;
+        }
+        window._aq_guard.inBuffer = true;
+        window._aq_guard.lastResetTime = Date.now();
+        var delay = CONFIG.BUFFER.RESET_DELAY_MIN +
+                    Math.random() * (CONFIG.BUFFER.RESET_DELAY_MAX - CONFIG.BUFFER.RESET_DELAY_MIN);
+        log('Buffer start (' + (reason || 'unknown') + '), restore in ' + Math.round(delay) + 'ms');
+        window._aq_guard.pendingRestoreTimer = setTimeout(function() {
+            window._aq_guard.inBuffer = false;
+            window._aq_guard.pendingRestoreTimer = null;
+            log('Buffer end, ramping to ' + window._aq_guard.target + 'x');
+            applyTargetSpeedWithRamp();
+        }, delay);
+    }
+
+    function scheduleInitialSpeed() {
+        window._aq_guard.inBuffer = true;
+        log('Initial delay: ' + CONFIG.BUFFER.INITIAL_DELAY + 'ms before first speedup');
+        window._aq_guard.pendingRestoreTimer = setTimeout(function() {
+            window._aq_guard.inBuffer = false;
+            window._aq_guard.pendingRestoreTimer = null;
+            window._aq_guard.initialApplied = true;
+            log('Initial delay complete, ramping to ' + window._aq_guard.target + 'x');
+            applyTargetSpeedWithRamp();
+        }, CONFIG.BUFFER.INITIAL_DELAY);
+    }
+
+    // ========== 安装拦截 ==========
+    function installGuard() {
+        try {
+            var BM = cc.js.getClassByName('BattleModule');
+            if (BM && BM.Ins) {
+                BM.Ins.setSpeedByBattleType(CONFIG.BATTLE_TYPE, window._aq_guard.target);
+                var origGet = BM.Ins.getSpeedByBattleType;
+                if (origGet && !BM.Ins._guardGetHooked) {
+                    BM.Ins.getSpeedByBattleType = function(bt) {
+                        var r = origGet.apply(this, arguments);
+                        if (window._aq_guard.enabled && !window._aq_guard.inBuffer && r > 0 && r < window._aq_guard.target) {
+                            log('BM.getSpeedByBattleType(' + bt + ')=' + r + ' -> ' + window._aq_guard.target);
+                            return window._aq_guard.target;
+                        }
+                        return r;
+                    };
+                    BM.Ins._guardGetHooked = true;
+                }
+                log('BattleModule cache corrected to ' + window._aq_guard.target + 'x');
+            }
+        } catch(e) { log('BM hook error: ' + e.message); }
+
+        try {
+            var TD = cc.js.getClassByName('TDModule');
+            if (TD && TD.Ins && !TD.Ins._guardHooked) {
+                var origDisp = TD.Ins.dispatchEvent;
+                TD.Ins.dispatchEvent = function() {
+                    var args = Array.prototype.slice.call(arguments);
+                    if (args[0] === CONFIG.TD_EVENT.LocalSetSpeed && window._aq_guard.enabled) {
+                        var origVal = args[1];
+                        if (Array.isArray(origVal)) origVal = origVal[0];
+                        if (origVal !== undefined) {
+                            if (origVal < CONFIG.BUFFER.MIN_BUFFER_SPEED) {
+                                log('LocalSetSpeed(' + origVal + ') -> ' + CONFIG.BUFFER.MIN_BUFFER_SPEED + ' (buffer cap)');
+                                if (Array.isArray(args[1])) args[1] = [CONFIG.BUFFER.MIN_BUFFER_SPEED];
+                                else args[1] = CONFIG.BUFFER.MIN_BUFFER_SPEED;
+                            }
+                            if (origVal !== window._aq_guard.target) {
+                                window._aq_guard.corrections++;
+                                window._aq_guard.lastCorrected = Date.now();
+                                scheduleSpeedRestore('LocalSetSpeed=' + origVal);
+                            }
+                        }
+                    }
+                    if (args[0] === CONFIG.TD_EVENT.TimeSpeedUpdate && window._aq_guard.enabled) {
+                        var origSpd = args[1];
+                        if (Array.isArray(origSpd)) origSpd = origSpd[0];
+                        if (origSpd !== undefined && origSpd !== window._aq_guard.target && !window._aq_guard.inBuffer) {
+                            log('TimeSpeedUpdate(' + origSpd + ') -> ' + window._aq_guard.target);
+                            if (Array.isArray(args[1])) args[1] = [window._aq_guard.target];
+                            else args[1] = window._aq_guard.target;
+                        }
+                    }
+                    return origDisp.apply(this, args);
+                };
+                TD.Ins._guardHooked = true;
+                log('TDModule.dispatchEvent guard installed (buffer-aware)');
+            }
+        } catch(e) { log('TD hook error: ' + e.message); }
+
+        var frameClasses = ['TDBattleFrame', 'TDBattleTeamFrame'];
+        frameClasses.forEach(function(className) {
+            try {
+                var cls = cc.js.getClassByName(className);
+                if (!cls || !cls.prototype || cls.prototype._guardHooked) return;
+                var origLocal = cls.prototype._setLoacalSpeed;
+                if (origLocal) {
+                    cls.prototype._setLoacalSpeed = function(e, t) {
+                        if (window._aq_guard.enabled) {
+                            var val = t && t[0];
+                            if (val !== undefined) {
+                                if (val < CONFIG.BUFFER.MIN_BUFFER_SPEED) {
+                                    log(className + '._setLoacalSpeed(' + val + ') -> ' + CONFIG.BUFFER.MIN_BUFFER_SPEED + ' (buffer cap)');
+                                    if (t && t.length) t[0] = CONFIG.BUFFER.MIN_BUFFER_SPEED;
+                                    else t = [CONFIG.BUFFER.MIN_BUFFER_SPEED];
+                                    val = CONFIG.BUFFER.MIN_BUFFER_SPEED;
+                                }
+                                if (val !== window._aq_guard.target) {
+                                    window._aq_guard.corrections++;
+                                    window._aq_guard.lastCorrected = Date.now();
+                                    scheduleSpeedRestore(className + '._setLoacalSpeed=' + val);
+                                }
+                            }
+                        }
+                        return origLocal.apply(this, arguments);
+                    };
+                }
+                var origSetTime = cls.prototype._setTimeSpeed;
+                if (origSetTime) {
+                    cls.prototype._setTimeSpeed = function(e) {
+                        if (window._aq_guard.enabled) {
+                            scheduleSpeedRestore(className + '._setTimeSpeed=' + e);
+                            log(className + '._setTimeSpeed blocked, scheduled restore');
+                            return;
+                        }
+                        return origSetTime.apply(this, arguments);
+                    };
+                }
+                cls.prototype._guardHooked = true;
+                log(className + ' guards installed (buffer-aware)');
+            } catch(e) { log(className + ' hook error: ' + e.message); }
+        });
+
+        try {
+            var BF = cc.js.getClassByName('BattleFrame');
+            if (BF && BF.prototype && !BF.prototype._guardHooked) {
+                var origBtn = BF.prototype._onButtonSpeed;
+                if (origBtn) {
+                    BF.prototype._onButtonSpeed = function(e) {
+                        if (window._aq_guard.enabled) {
+                            log('BF._onButtonSpeed intercepted, scheduling restore');
+                            scheduleSpeedRestore('button_click');
+                            return;
+                        }
+                        return origBtn.apply(this, arguments);
+                    };
+                }
+                BF.prototype._guardHooked = true;
+                log('BattleFrame._onButtonSpeed guard installed');
+            }
+        } catch(e) { log('BF hook error: ' + e.message); }
+
+        try {
+            var scene = cc.director.getScene();
+            var spinePatched = 0;
+            function patchSpineUpdate(node, depth) {
+                if (depth > 10) return;
+                var comps = node.getComponents ? node.getComponents(cc.Component) : [];
+                for (var i = 0; i < comps.length; i++) {
+                    var c = comps[i];
+                    try {
+                        if (c.update && !c._spinePatched) {
+                            var updateStr = c.update.toString();
+                            if (updateStr.indexOf('isCustomUpdate') >= 0 || updateStr.indexOf('prototype.update') >= 0) {
+                                var origUpdate = c.update.bind(c);
+                                c.update = function(dt) {
+                                    try { origUpdate(dt); } catch(e) {}
+                                };
+                                c._spinePatched = true;
+                                spinePatched++;
+                            }
+                        }
+                    } catch(e) {}
+                }
+                if (node.children) {
+                    for (var j = 0; j < node.children.length; j++) patchSpineUpdate(node.children[j], depth+1);
+                }
+            }
+            if (scene && scene.children[0]) patchSpineUpdate(scene.children[0], 0);
+            log('Spine update protection: ' + spinePatched + ' components patched');
+        } catch(e) { log('Spine patch error: ' + e.message); }
+
+        var watchdog = setInterval(function() {
+            try {
+                var bfIns = getBattleFrameIns();
+                var isInBattle = bfIns && (bfIns._inBattle === true || (bfIns._inBattle === undefined && bfIns._battleMain));
+                if (isInBattle) {
+                    if (!window._aq_guard.enabled) {
+                        window._aq_guard.enabled = true;
+                        window._aq_guard.battleStartTime = Date.now();
+                        log('Battle detected! Initial delay: ' + CONFIG.BUFFER.INITIAL_DELAY + 'ms');
+                        scheduleInitialSpeed();
+                        return;
+                    }
+                    if (window._aq_guard.inBuffer) return;
+                    if (window._aq_guard.pendingRestoreTimer) return;
+                    if (window._aq_guard.rampTimer) return;
+                    if (!window._aq_guard.initialApplied) return;
+                    var currentScale = window._aq_guard.currentScale || 1;
+                    if (currentScale > 0 && currentScale < window._aq_guard.target) {
+                        log('Watchdog: speed=' + currentScale + ' < target=' + window._aq_guard.target + ', restoring');
+                        applyTargetSpeed();
+                    }
+                } else {
+                    if (window._aq_guard.enabled) {
+                        log('Battle ended, cleaning up...');
+                        window._aq_guard.enabled = false;
+                        window._aq_guard.initialApplied = false;
+                        window._aq_guard.inBuffer = false;
+                        window._aq_guard.currentScale = 1;
+                        if (window._aq_guard.pendingRestoreTimer) {
+                            clearTimeout(window._aq_guard.pendingRestoreTimer);
+                            window._aq_guard.pendingRestoreTimer = null;
+                        }
+                        if (window._aq_guard.rampTimer) {
+                            clearTimeout(window._aq_guard.rampTimer);
+                            window._aq_guard.rampTimer = null;
+                        }
+                        var scheduler = cc.director.getScheduler();
+                        if (scheduler) scheduler.setTimeScale(1);
+                        try {
+                            var scene = cc.director.getScene();
+                            if (scene && scene.children[0]) {
+                                function clearSpineTracks(node, depth) {
+                                    if (depth > 10) return;
+                                    var comps = node.getComponents ? node.getComponents(cc.Component) : [];
+                                    for (var i = 0; i < comps.length; i++) {
+                                        var c = comps[i];
+                                        try {
+                                            if (c._state && c._state.clearTracks) {
+                                                c._state.clearTracks();
+                                            }
+                                        } catch(e) {}
+                                    }
+                                    if (node.children) {
+                                        for (var j = 0; j < node.children.length; j++) clearSpineTracks(node.children[j], depth+1);
+                                    }
+                                }
+                                clearSpineTracks(scene.children[0], 0);
+                                log('Spine tracks cleared on battle exit');
+                            }
+                        } catch(e) { log('Spine cleanup error: ' + e.message); }
+                    }
+                }
+            } catch(e) {}
+        }, CONFIG.BUFFER.WATCHDOG_INTERVAL);
+        window._aq_guard._timer = watchdog;
+
+        try {
+            var SDKMgr = cc.js.getClassByName('SDKMgr');
+            if (SDKMgr && SDKMgr.Ins && SDKMgr.Ins.performConfig) {
+                var checkTimer = setInterval(function() {
+                    try {
+                        if (SDKMgr.Ins.performConfig) {
+                            SDKMgr.Ins.performConfig[CONFIG.CHECK_SPEED_KEY] = false;
+                            clearInterval(checkTimer);
+                            log('Speed check disabled');
+                        }
+                    } catch(e) {}
+                }, 500);
+            }
+        } catch(e) {}
+
+        log('Speed Guard v3.2 (No-Scheduler + Spine-Safe) installed. Target: ' + window._aq_guard.target + 'x');
+    }
+
+    // ========== 全局API ==========
+    window.setGuardSpeed = function(n) {
+        if (isNaN(n) || n <= 0 || n > 50) { log('Invalid: ' + n); return; }
+        window._aq_guard.target = n;
+        var BM = cc.js.getClassByName('BattleModule');
+        if (BM && BM.Ins) BM.Ins.setSpeedByBattleType(CONFIG.BATTLE_TYPE, n);
+        if (!window._aq_guard.inBuffer && window._aq_guard.initialApplied) {
+            applyTargetSpeed();
+        }
+        showToast('Guard: ' + n + 'x', '#00ff00');
+    };
+
+    window.getGuardStatus = function() {
+        var info = {
+            target: window._aq_guard.target + 'x',
+            enabled: window._aq_guard.enabled,
+            inBuffer: window._aq_guard.inBuffer,
+            initialApplied: window._aq_guard.initialApplied,
+            currentScale: window._aq_guard.currentScale,
+            corrections: window._aq_guard.corrections,
+            lastCorrected: window._aq_guard.lastCorrected ? (Date.now() - window._aq_guard.lastCorrected) + 'ms ago' : 'never',
+            battleDuration: window._aq_guard.battleStartTime ? Math.round((Date.now() - window._aq_guard.battleStartTime) / 1000) + 's' : 'not started',
+            pendingRestore: window._aq_guard.pendingRestoreTimer ? 'yes' : 'no',
+            rampActive: window._aq_guard.rampTimer ? 'yes' : 'no'
+        };
+        console.log('[SpeedGuard] Status:', JSON.stringify(info, null, 2));
+        return info;
+    };
+
+    window.triggerBuffer = function(reason) {
+        scheduleSpeedRestore(reason || 'manual');
+        showToast('Buffer triggered: ' + reason, '#ffcc00');
+    };
+
+    // ========== 启动 ==========
+    function waitCocos(cb) {
+        var timer = setInterval(function() {
+            if (typeof cc !== 'undefined' && cc.js && cc.js.getClassByName) {
+                clearInterval(timer);
+                cb();
+            }
+        }, 500);
+    }
+
+    waitCocos(function() {
+        log('Cocos ready, installing buffer guards...');
+        installGuard();
+        setTimeout(function() {
+            showToast('Guard v3.2 ready: ' + CONFIG.DEFAULT_SPEED + 'x (Spine-Safe)', '#00ff00');
+        }, 800);
+    });
+})();
