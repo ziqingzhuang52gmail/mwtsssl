@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         MyCocos - 倍速自动保护终极版（缓冲防检测+iOS兼容）
+// @name         MyCocos - 倍速自动保护终极版（缓冲防检测+结算包补偿+iOS兼容）
 // @namespace    http://tampermonkey.net/
-// @version      3.3.0
-// @description  缓冲防检测 + 沙盒突破注入 + 不Hook scheduler避免Spine崩溃 + 退出战斗自动清理 (iOS Safari 兼容)
+// @version      4.0.0
+// @description  缓冲防检测 + 沙盒突破注入 + 结算包endFrame/operFrame等比缩放 + 速度异常弹窗拦截 + 防断连 + Spine安全 + 退出战斗自动清理 (iOS Safari 兼容)
 // @author       Ace
 // @match        *://*/*
 // @grant        none
@@ -56,6 +56,12 @@
                 TimeSpeedUpdate: 13,
                 LocalSetSpeed: 17
             },
+            PROTOCOL: {
+                MODULE_BUILD_PROXY: 82,
+                MODULE_BUILD_WORLD_PROXY: 93,
+                CMD_QUIT_ROOM: 4,
+                TICK_INTERVAL_IN_SEC: 10
+            },
             BUFFER: {
                 INITIAL_DELAY: 3000,
                 RESET_DELAY_MIN: 1500,
@@ -79,7 +85,8 @@
             inBuffer: false,
             initialApplied: false,
             rampTimer: null,
-            currentScale: 1
+            currentScale: 1,
+            _blockClose: false
         };
 
         // ========== 工具函数 ==========
@@ -579,7 +586,120 @@
                 }
             } catch(e) {}
 
-            log('Speed Guard v3.3 (iOS + Spine-Safe) installed. Target: ' + window._aq_guard.target + 'x');
+            // 8. SocketMgr.send 结算包补偿（核心防检测）
+            // 拦截 QuitRoom 请求(module=82/93, cmd=4)，将 endFrame/totalTime/operFrame 按 SPEED 等比缩放
+            // 使服务端校验的 totalTime 匹配真实经过时间，避免错误码 10000361
+            try {
+                var SM = cc.js.getClassByName('SocketMgr');
+                if (SM && SM.prototype && SM.prototype.send && !SM.prototype._guardSendHooked) {
+                    var origSend = SM.prototype.send;
+                    SM.prototype.send = function(moduleId, cmdId, data, callbacks) {
+                        try {
+                            if ((moduleId === CONFIG.PROTOCOL.MODULE_BUILD_PROXY ||
+                                 moduleId === CONFIG.PROTOCOL.MODULE_BUILD_WORLD_PROXY) &&
+                                cmdId === CONFIG.PROTOCOL.CMD_QUIT_ROOM &&
+                                data && data.endFrame != null &&
+                                window._aq_guard.target > 1) {
+
+                                var scale = window._aq_guard.target;
+                                var rawEndFrame = data.endFrame;
+                                var rawTotalTime = data.totalTime;
+
+                                data.endFrame = Math.floor(rawEndFrame / scale);
+
+                                if (data.totalTime != null) {
+                                    data.totalTime = Math.floor(data.endFrame / CONFIG.PROTOCOL.TICK_INTERVAL_IN_SEC);
+                                }
+
+                                var opCount = 0;
+                                if (data.operations) {
+                                    var ops = data.operations;
+                                    if (typeof ops.getValues === 'function') {
+                                        ops = ops.getValues();
+                                    } else if (Array.isArray(ops)) {
+                                        // already array
+                                    } else if (typeof ops === 'object') {
+                                        var newArr = [];
+                                        var keys = Object.keys(ops);
+                                        for (var k = 0; k < keys.length; k++) {
+                                            if (keys[k].charAt(0) !== '_') {
+                                                newArr.push(ops[keys[k]]);
+                                            }
+                                        }
+                                        ops = newArr;
+                                    }
+                                    for (var oi = 0; oi < ops.length; oi++) {
+                                        var op = ops[oi];
+                                        if (op && op.operFrame != null && op.operFrame > 0) {
+                                            op.operFrame = Math.floor(op.operFrame / scale);
+                                            opCount++;
+                                        }
+                                    }
+                                }
+
+                                log('=== 退房补偿 ===');
+                                log('endFrame: ' + rawEndFrame + ' -> ' + data.endFrame + ' (/' + scale + ')');
+                                log('totalTime: ' + rawTotalTime + ' -> ' + data.totalTime);
+                                log('operations: ' + opCount + ' 条 operFrame 已补偿');
+                                log('================');
+                            }
+                        } catch(e) { log('SocketMgr.send compensate error: ' + e.message); }
+                        return origSend.apply(this, arguments);
+                    };
+                    SM.prototype._guardSendHooked = true;
+                    log('SocketMgr.send 结算包补偿已安装');
+                }
+            } catch(e) { log('SocketMgr.send hook error: ' + e.message); }
+
+            // 9. UIMgr.open 拦截速度异常弹窗
+            // _checkCheat 触发时调用 UIMgr.open 显示"检查到速度异常"弹窗
+            // 拦截弹窗并设置 _blockClose 标记，阻止随后的 SocketMgr.close
+            try {
+                var UIMgr = cc.js.getClassByName('UIMgr');
+                if (UIMgr && UIMgr.prototype && UIMgr.prototype.open && !UIMgr.prototype._guardHooked) {
+                    var origOpen = UIMgr.prototype.open;
+                    UIMgr.prototype.open = function(view, layerType, data) {
+                        try {
+                            if (data && data.commonTips) {
+                                var tips = String(data.commonTips);
+                                if (tips.indexOf('\u901f\u5ea6\u5f02\u5e38') >= 0 ||
+                                    tips.indexOf('\u65ad\u5f00\u8fde\u63a5') >= 0) {
+                                    log('拦截速度异常弹窗: ' + tips);
+                                    window._aq_guard._blockClose = true;
+                                    setTimeout(function() {
+                                        window._aq_guard._blockClose = false;
+                                    }, 2000);
+                                    return null;
+                                }
+                            }
+                        } catch(e) { log('UIMgr.open intercept error: ' + e.message); }
+                        return origOpen.apply(this, arguments);
+                    };
+                    UIMgr.prototype._guardHooked = true;
+                    log('UIMgr.open 弹窗拦截已安装');
+                }
+            } catch(e) { log('UIMgr hook error: ' + e.message); }
+
+            // 10. SocketMgr.close 防断连保护
+            // _checkCheet 触发弹窗后会调用 SocketMgr.close() 断开连接
+            // 当 _blockClose=true 时阻断 close，保持连接
+            try {
+                var SM2 = cc.js.getClassByName('SocketMgr');
+                if (SM2 && SM2.prototype && SM2.prototype.close && !SM2.prototype._guardCloseHooked) {
+                    var origClose = SM2.prototype.close;
+                    SM2.prototype.close = function() {
+                        if (window._aq_guard._blockClose) {
+                            log('阻断 SocketMgr.close (速度检测触发，保持连接)');
+                            return;
+                        }
+                        return origClose.apply(this, arguments);
+                    };
+                    SM2.prototype._guardCloseHooked = true;
+                    log('SocketMgr.close 防断连已安装');
+                }
+            } catch(e) { log('SocketMgr.close hook error: ' + e.message); }
+
+            log('Speed Guard v4.0 (iOS + Protocol-Safe) installed. Target: ' + window._aq_guard.target + 'x');
         }
 
         // ========== 全局API ==========
@@ -605,10 +725,46 @@
                 lastCorrected: window._aq_guard.lastCorrected ? (Date.now() - window._aq_guard.lastCorrected) + 'ms ago' : 'never',
                 battleDuration: window._aq_guard.battleStartTime ? Math.round((Date.now() - window._aq_guard.battleStartTime) / 1000) + 's' : 'not started',
                 pendingRestore: window._aq_guard.pendingRestoreTimer ? 'yes' : 'no',
-                rampActive: window._aq_guard.rampTimer ? 'yes' : 'no'
+                rampActive: window._aq_guard.rampTimer ? 'yes' : 'no',
+                blockClose: window._aq_guard._blockClose
             };
             console.log('[SpeedGuard] Status:', JSON.stringify(info, null, 2));
             return info;
+        };
+
+        window.checkGuardHooks = function() {
+            var results = [];
+            function check(name, fn) {
+                try { results.push(name + ': ' + (fn() ? 'YES' : 'NO')); }
+                catch(e) { results.push(name + ': ERROR ' + e.message); }
+            }
+            check('SocketMgr.send', function() {
+                var SM = cc.js.getClassByName('SocketMgr');
+                return SM && SM.prototype && SM.prototype._guardSendHooked === true;
+            });
+            check('UIMgr.open', function() {
+                var UIMgr = cc.js.getClassByName('UIMgr');
+                return UIMgr && UIMgr.prototype && UIMgr.prototype._guardHooked === true;
+            });
+            check('SocketMgr.close', function() {
+                var SM = cc.js.getClassByName('SocketMgr');
+                return SM && SM.prototype && SM.prototype._guardCloseHooked === true;
+            });
+            check('TDModule.dispatchEvent', function() {
+                var TD = cc.js.getClassByName('TDModule');
+                return TD && TD.Ins && TD.Ins._guardHooked === true;
+            });
+            check('BattleModule.getSpeedByBattleType', function() {
+                var BM = cc.js.getClassByName('BattleModule');
+                return BM && BM.Ins && BM.Ins._guardGetHooked === true;
+            });
+            check('SDKMgr.performConfig[40003]', function() {
+                var SDKMgr = cc.js.getClassByName('SDKMgr');
+                return SDKMgr && SDKMgr.Ins && SDKMgr.Ins.performConfig && SDKMgr.Ins.performConfig[40003] === false;
+            });
+            var output = results.join('\n');
+            console.log('[SpeedGuard] Hook Status:\n' + output);
+            return output;
         };
 
         window.triggerBuffer = function(reason) {
@@ -630,7 +786,7 @@
             log('Cocos ready, installing buffer guards...');
             installGuard();
             setTimeout(function() {
-                showToast('Guard v3.3 ready: ' + CONFIG.DEFAULT_SPEED + 'x (iOS)', '#00ff00');
+                showToast('Guard v4.0 ready: ' + CONFIG.DEFAULT_SPEED + 'x (iOS+Protocol)', '#00ff00');
             }, 800);
         });
     }
