@@ -6,7 +6,7 @@
 
     // ========== 配置 ==========
     var CONFIG = {
-        DEFAULT_SPEED: 8,
+        DEFAULT_SPEED: 10,
         BATTLE_TYPE: 3,
         CHECK_SPEED_KEY: 40003,
         TD_EVENT: {

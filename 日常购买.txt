@@ -1,0 +1,18 @@
+[C2S] SocketMgr.ActivityProxy(18).GetCommonReward(13) {code: '4', jsonArgs: '{"code":1001}'}
+[C2S] SocketMgr.ActivityProxy(18).GetCommonReward(13) {code: '4', jsonArgs: '{"code":1002}'}
+[C2S] SocketMgr.ActivityProxy(18).GetCommonReward(13) {code: '4', jsonArgs: '{"code":1003}'}
+以下都是发送5次
+[C2S] SocketMgr.ActivityProxy(18).GetCommonReward(13) {code: '4', jsonArgs: '{"code":1004}'}
+[C2S] SocketMgr.ActivityProxy(18).GetCommonReward(13) {code: '4', jsonArgs: '{"code":1005}'}
+[C2S] SocketMgr.ActivityProxy(18).GetCommonReward(13) {code: '4', jsonArgs: '{"code":1006}'}
+[C2S] SocketMgr.ActivityProxy(18).GetCommonReward(13) {code: '4', jsonArgs: '{"code":1007}'}
+[C2S] SocketMgr.ActivityProxy(18).GetCommonReward(13) {code: '4', jsonArgs: '{"code":1008}'}
+[C2S] SocketMgr.ActivityProxy(18).GetCommonReward(13) {code: '4', jsonArgs: '{"code":1009}'}
+[C2S] SocketMgr.ActivityProxy(18).GetCommonReward(13) {code: '4', jsonArgs: '{"code":1010}'}
+
+=====
+go(18, 16, {code: '72', jsonArgs: '{"code":1001}'})
+
+go(18, 16, {code: '1000102', jsonArgs: '{"type":3}'})7次
+go(18, 13, {code: '97', jsonArgs: '{"type":3,"code":4}'})
+go(86, 3, {})7次
