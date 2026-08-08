@@ -1,0 +1,390 @@
+// ============================================================
+// 阿庆发包器 v2.0 — 浮动UI面板版（PC + iOS Safari 兼容）
+// v1.0 → v2.0：新增可拖拽浮动面板，iOS 无控制台也能操作
+//
+// 发包核心逻辑（逆向自 SocketMgr）：
+//   cc.js.getClassByName('SocketMgr') → C.Ins 单例
+//   → 检查 ins._socket.readyState === 1
+//   → ins.send(mod, cmd, data)
+//
+// iOS Safari 兼容要点：
+//   - 浮动面板 pointer events 拖拽（iOS 13+ 原生支持）
+//   - touch-action:manipulation 消除 300ms 点击延迟
+//   - user-select:none + -webkit-touch-callout:none 防长按选中/菜单
+//   - 不用 eval/new Function（避免 CSP）
+//   - console.info 输出（不被 SetDebugModel 静默）
+//   - 不覆写任何原生 API
+//
+// 浮动面板：可拖拽，只有 [开始] [暂停] 两个按钮
+// 其他配置直接改下方 cfg 代码
+//
+// 控制台命令（PC 可用，iOS 用面板代替）：
+//   aqStart() / aqPause() / aqStatus()
+//   aqGo(mod, cmd, data) / aqResend() / aqLast()
+// ============================================================
+(function(){
+  if(window._aq_sender){
+    console.info('[发包器] 已注入，跳过');
+    return;
+  }
+  window._aq_sender = true;
+  var out = console.info.bind(console);
+
+  // ════════════════════════════════════════
+  // 配置区（直接改这里）
+  // ════════════════════════════════════════
+  var cfg = {
+    mod: 15,
+    cmd: 28,
+    data: {friendId:  '24160', operationType: '4', sendOrReceiveList: {"canSendGiftList": ["395776"], "canReceiveGiftList": []}},
+    intervalSec: 3,    // 间隔秒数
+    batchCount: 30,    // 每批发送次数
+    pauseSec: 12,      // 批次间暂停秒数
+    jitter: 0.3,       // 抖动比例 0~1（±30%）
+  };
+
+  // ════════════════════════════════════════
+  // 第一部分：发包核心
+  // ════════════════════════════════════════
+
+  function getSocket(){
+    try{
+      var C = cc.js.getClassByName('SocketMgr');
+      if(!C) return null;
+      var ins = C.Ins;
+      if(!ins) return null;
+      if(!ins._socket || ins._socket.readyState !== 1) return null;
+      return ins;
+    }catch(e){ return null; }
+  }
+
+  window.aqGo = function(mod, cmd, data){
+    var ins = getSocket();
+    if(!ins){
+      out('[发包器] ❌ SocketMgr 未就绪');
+      return false;
+    }
+    if(data === undefined) data = null;
+    try{
+      ins.send(mod, cmd, data);
+      var modName = ins.getModuleName ? ins.getModuleName(mod) : mod;
+      var cmdName = ins.getCmdName ? ins.getCmdName(mod, cmd) : cmd;
+      _lastSend = { mod: mod, cmd: cmd, data: data, modName: modName, cmdName: cmdName, ts: new Date().toLocaleTimeString() };
+      out('🚀 [发包] go(' + mod + ', ' + cmd + ', ' + (data ? JSON.stringify(data) : 'null') + ')  ' + modName + '.' + cmdName);
+      return true;
+    }catch(e){
+      out('[发包器] ❌ 发包异常: ' + e.message);
+      return false;
+    }
+  };
+
+  window.aqSendLine = function(line){
+    var flat = String(line).replace(/\s+/g, ' ').trim();
+    var mod, cmd;
+    var m = flat.match(/(\w+)\((\d+)\)\.(\w+)\((\d+)\)/);
+    if(m){
+      mod = parseInt(m[2]); cmd = parseInt(m[4]);
+    }else{
+      var m2 = flat.match(/(\w+)\((\d+)\)\s*来自\s*(\w+)\((\d+)\)/);
+      if(m2){ cmd = parseInt(m2[2]); mod = parseInt(m2[4]); }
+      else{ out('[发包器] ❌ 无法解析'); return false; }
+    }
+    var dataObj = null;
+    var dataMatch = flat.match(/\{.*\}/);
+    if(dataMatch){
+      try{ dataObj = JSON.parse(dataMatch[0]); }
+      catch(e){
+        var fixed = dataMatch[0].replace(/'/g, '"').replace(/(\w+):/g, '"$1":');
+        try{ dataObj = JSON.parse(fixed); }catch(e2){ dataObj = null; }
+      }
+    }
+    return window.aqGo(mod, cmd, dataObj);
+  };
+
+  var _lastSend = null;
+  window.aqResend = function(){
+    if(!_lastSend){ out('[发包器] 没有可重发的包'); return false; }
+    return window.aqGo(_lastSend.mod, _lastSend.cmd, _lastSend.data);
+  };
+
+  window.aqLast = function(){
+    if(!_lastSend){ out('[发包器] 没有发包记录'); return; }
+    out('[发包器] 最近: go(' + _lastSend.mod + ', ' + _lastSend.cmd + ', ' + (_lastSend.data ? JSON.stringify(_lastSend.data) : 'null') + ') ' + _lastSend.modName + '.' + _lastSend.cmdName + ' @ ' + _lastSend.ts);
+  };
+
+  // ════════════════════════════════════════
+  // 第二部分：自动发包
+  // ════════════════════════════════════════
+
+  var running = false;
+  var sentCount = 0;
+  var batchSent = 0;
+  var timerId = null;
+  var phase = 'idle';
+
+  function randJitter(baseSec){
+    if(typeof baseSec !== 'number' || !isFinite(baseSec) || baseSec <= 0) return 6;
+    var j = cfg.jitter;
+    if(typeof j !== 'number' || j <= 0) return baseSec;
+    var offset = baseSec * j * (Math.random() * 2 - 1);
+    return Math.max(1, baseSec + offset);
+  }
+
+  function doSend(){
+    if(!running) return;
+    var ok = window.aqGo(cfg.mod, cfg.cmd, cfg.data);
+    if(ok){
+      sentCount++;
+      batchSent++;
+      out('✅ [自动] #' + sentCount + ' (批次 ' + batchSent + '/' + cfg.batchCount + ')');
+      updateUI();
+    }else{
+      out('❌ [自动] 发包失败，自动暂停');
+      window.aqPause();
+      return;
+    }
+    if(batchSent >= cfg.batchCount){
+      phase = 'pausing';
+      var pauseTime = randJitter(cfg.pauseSec);
+      out('⏸ [自动] 批次完成，暂停 ' + pauseTime.toFixed(1) + ' 秒...');
+      updateUI();
+      timerId = setTimeout(function(){
+        batchSent = 0;
+        phase = 'sending';
+        scheduleNext();
+      }, pauseTime * 1000);
+    }else{
+      scheduleNext();
+    }
+  }
+
+  function scheduleNext(){
+    if(!running) return;
+    var wait = randJitter(cfg.intervalSec);
+    timerId = setTimeout(doSend, wait * 1000);
+  }
+
+  window.aqStart = function(){
+    if(running){ out('[自动] 已在运行中'); return; }
+    var ins = getSocket();
+    if(!ins){ out('[自动] ❌ SocketMgr 未就绪'); updateUI(); return; }
+    running = true;
+    batchSent = 0;
+    phase = 'sending';
+    out('[自动] 开始 go(' + cfg.mod + ', ' + cfg.cmd + ', ' + JSON.stringify(cfg.data) + ')');
+    out('  间隔 ' + cfg.intervalSec + 's | 每' + cfg.batchCount + '次暂停 ' + cfg.pauseSec + 's | 抖动 ±' + (cfg.jitter * 100) + '%');
+    updateUI();
+    doSend();
+  };
+
+  window.aqPause = function(){
+    running = false;
+    if(timerId){ clearTimeout(timerId); timerId = null; }
+    phase = 'idle';
+    out('[自动] 已暂停 (累计 ' + sentCount + ' 次)');
+    updateUI();
+  };
+
+  window.aqStatus = function(){
+    out('═══ 发包器状态 ═══');
+    out('  运行: ' + (running ? '✅ ' + phase : '⏹ 已停止'));
+    out('  命令: go(' + cfg.mod + ', ' + cfg.cmd + ', ' + JSON.stringify(cfg.data) + ')');
+    out('  间隔: ' + cfg.intervalSec + 's | 批次: ' + batchSent + '/' + cfg.batchCount + ' | 暂停: ' + cfg.pauseSec + 's');
+    out('  抖动: ±' + (cfg.jitter * 100) + '% | 累计: ' + sentCount + ' 次');
+    var ins = getSocket();
+    out('  连接: ' + (ins ? '✅ 已连接' : '❌ 未就绪'));
+  };
+
+  // 控制台配置命令（iOS 用不到，PC 可用）
+  window.aqSetCmd = function(mod, cmd, data){
+    cfg.mod = mod; cfg.cmd = cmd; cfg.data = data || null;
+    out('[自动] 命令已修改: go(' + mod + ', ' + cmd + ', ' + JSON.stringify(cfg.data) + ')');
+  };
+  window.aqSetGap = function(sec){
+    if(typeof sec !== 'number' || sec <= 0) return;
+    cfg.intervalSec = sec; out('[自动] 间隔: ' + sec + 's');
+  };
+  window.aqSetBatch = function(n){
+    if(typeof n !== 'number' || n <= 0) return;
+    cfg.batchCount = n; out('[自动] 批次: ' + n);
+  };
+  window.aqSetPause = function(sec){
+    if(typeof sec !== 'number' || sec <= 0) return;
+    cfg.pauseSec = sec; out('[自动] 暂停: ' + sec + 's');
+  };
+  window.aqSetJitter = function(ratio){
+    if(typeof ratio !== 'number' || ratio < 0 || ratio > 1) return;
+    cfg.jitter = ratio; out('[自动] 抖动: ±' + (ratio * 100) + '%');
+  };
+
+  // ════════════════════════════════════════
+  // 第三部分：浮动 UI 面板（PC + iOS Safari）
+  // ════════════════════════════════════════
+
+  var panel, btnStart, btnPause, statText;
+
+  function createUI(){
+    if(document.getElementById('_aq_panel')) return;
+
+    panel = document.createElement('div');
+    panel.id = '_aq_panel';
+    panel.style.cssText = [
+      'position:fixed', 'top:60px', 'right:10px', 'z-index:2147483647',
+      'background:rgba(15,15,25,0.92)',
+      'border-radius:10px',
+      'box-shadow:0 4px 16px rgba(0,0,0,0.6)',
+      'font-family:-apple-system,monospace',
+      'font-size:13px',
+      'color:#e0e0e0',
+      'user-select:none', '-webkit-user-select:none', '-webkit-touch-callout:none',
+      'touch-action:manipulation',
+      'overflow:hidden',
+      'min-width:120px'
+    ].join(';');
+
+    // 标题栏（拖拽手柄）
+    var header = document.createElement('div');
+    header.textContent = '📦 发包器';
+    header.style.cssText = [
+      'padding:7px 12px',
+      'background:rgba(40,40,60,0.95)',
+      'font-size:12px', 'font-weight:bold',
+      'border-bottom:1px solid rgba(255,255,255,0.08)',
+      'cursor:default'
+    ].join(';');
+
+    // 按钮容器
+    var btnBox = document.createElement('div');
+    btnBox.style.cssText = 'display:flex;gap:6px;padding:8px;';
+
+    btnStart = document.createElement('div');
+    btnStart.textContent = '▶ 开始';
+    btnStart.style.cssText = btnStyle('#2d8a3e', true);
+
+    btnPause = document.createElement('div');
+    btnPause.textContent = '⏸ 暂停';
+    btnPause.style.cssText = btnStyle('#8a3e3e', false);
+
+    btnBox.appendChild(btnStart);
+    btnBox.appendChild(btnPause);
+
+    // 状态文字
+    statText = document.createElement('div');
+    statText.style.cssText = 'padding:2px 12px 8px;font-size:11px;color:#888;';
+    statText.textContent = '⏹ 已停止 | 0次';
+
+    panel.appendChild(header);
+    panel.appendChild(btnBox);
+    panel.appendChild(statText);
+
+    // 按钮点击（click 在 iOS + touch-action:manipulation 下无延迟）
+    btnStart.addEventListener('click', function(e){
+      e.preventDefault();
+      e.stopPropagation();
+      window.aqStart();
+    }, false);
+
+    btnPause.addEventListener('click', function(e){
+      e.preventDefault();
+      e.stopPropagation();
+      window.aqPause();
+    }, false);
+
+    // 拖拽（pointer events，iOS 13+ 原生支持）
+    var dragging = false;
+    var startX, startY, panelX, panelY;
+
+    header.addEventListener('pointerdown', function(e){
+      dragging = true;
+      header.setPointerCapture(e.pointerId);
+      startX = e.clientX;
+      startY = e.clientY;
+      var rect = panel.getBoundingClientRect();
+      panelX = rect.left;
+      panelY = rect.top;
+      e.preventDefault();
+    }, false);
+
+    header.addEventListener('pointermove', function(e){
+      if(!dragging) return;
+      var dx = e.clientX - startX;
+      var dy = e.clientY - startY;
+      var nx = panelX + dx;
+      var ny = panelY + dy;
+      // 限制在视口内
+      nx = Math.max(0, Math.min(window.innerWidth - panel.offsetWidth, nx));
+      ny = Math.max(0, Math.min(window.innerHeight - panel.offsetHeight, ny));
+      panel.style.left = nx + 'px';
+      panel.style.top = ny + 'px';
+      panel.style.right = 'auto';
+      e.preventDefault();
+    }, false);
+
+    header.addEventListener('pointerup', function(e){
+      dragging = false;
+      try{ header.releasePointerCapture(e.pointerId); }catch(err){}
+    }, false);
+
+    header.addEventListener('pointercancel', function(){
+      dragging = false;
+    }, false);
+
+    // 插入 DOM
+    if(document.body){
+      document.body.appendChild(panel);
+    }else{
+      setTimeout(function(){ document.body.appendChild(panel); }, 500);
+    }
+  }
+
+  function btnStyle(bg, active){
+    var base = [
+      'flex:1', 'text-align:center', 'padding:8px 4px',
+      'border-radius:6px', 'font-size:12px', 'font-weight:bold',
+      'color:#fff', 'cursor:pointer',
+      '-webkit-tap-highlight-color:transparent',
+      'transition:opacity 0.2s'
+    ].join(';');
+    if(active){
+      return base + ';background:' + bg + ';opacity:1';
+    }else{
+      return base + ';background:' + bg + ';opacity:0.4';
+    }
+  }
+
+  function updateUI(){
+    if(!btnStart) return;
+    // 按钮高亮：运行时开始变灰、暂停亮起；停止时反之
+    if(running){
+      btnStart.style.opacity = '0.4';
+      btnPause.style.opacity = '1';
+    }else{
+      btnStart.style.opacity = '1';
+      btnPause.style.opacity = '0.4';
+    }
+    // 状态文字
+    var icon = running ? (phase === 'pausing' ? '⏸' : '▶') : '⏹';
+    var stateText = running ? (phase === 'pausing' ? '暂停中' : '运行中') : '已停止';
+    statText.textContent = icon + ' ' + stateText + ' | ' + sentCount + '次';
+  }
+
+  // 等待 DOM 就绪后创建面板
+  function initUI(){
+    if(document.body){
+      createUI();
+    }else{
+      setTimeout(initUI, 300);
+    }
+  }
+  initUI();
+
+  // ════════════════════════════════════════
+  // 加载完成
+  // ════════════════════════════════════════
+  out('[发包器] v2.0 已加载（浮动面板版）');
+  out('  面板: [开始] [暂停] 按钮可点击拖拽');
+  out('  默认: go(' + cfg.mod + ', ' + cfg.cmd + ', ' + JSON.stringify(cfg.data) + ') 间隔' + cfg.intervalSec + 's 每' + cfg.batchCount + '次暂停' + cfg.pauseSec + 's');
+})();
+
+
+帮我更改为这个命令
